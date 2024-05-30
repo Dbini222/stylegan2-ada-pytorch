@@ -9,18 +9,20 @@
 """Train a GAN using the techniques described in the paper
 "Training Generative Adversarial Networks with Limited Data"."""
 
-import os
-import click
-import re
 import json
+import os
+import re
+import subprocess
 import tempfile
-import torch
-import dnnlib
 
-from training import training_loop
+import click
+import dnnlib
+import torch
+from FirestoreDataset import FirestoreDataset
 from metrics import metric_main
-from torch_utils import training_stats
-from torch_utils import custom_ops
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch_utils import custom_ops, training_stats
+from training import training_loop
 
 #----------------------------------------------------------------------------
 
@@ -28,6 +30,13 @@ class UserError(Exception):
     pass
 
 #----------------------------------------------------------------------------
+#check to see if the images are correctly downloaded
+def prepare_dataset(data_dir):
+    if not os.path.exists(data_dir) or not os.listdir(data_dir):
+        print(f"No data found in {data_dir}. Running the preparation script...")
+        subprocess.run(['python', 'download_and_prepare.py', '--data-dir', data_dir, '--metadata-collection', metadata_collection], check=True)
+    else:
+        print(f"Data ready in {data_dir}")
 
 def setup_training_loop_kwargs(
     # General options (not included in desc).
@@ -480,6 +489,8 @@ def main(ctx, outdir, dry_run, **config_kwargs):
       <PATH or URL>  Custom network pickle.
     """
     dnnlib.util.Logger(should_flush=True)
+    #prepare dataset
+    prepare_dataset(config_kwargs['data'])
 
     # Setup training options.
     try:
