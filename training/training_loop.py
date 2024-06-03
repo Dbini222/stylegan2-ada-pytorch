@@ -6,23 +6,22 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-import os
-import time
 import copy
 import json
+import os
 import pickle
-import psutil
-import PIL.Image
-import numpy as np
-import torch
-import dnnlib
-from torch_utils import misc
-from torch_utils import training_stats
-from torch_utils.ops import conv2d_gradfix
-from torch_utils.ops import grid_sample_gradfix
+import time
 
+import dnnlib
 import legacy
+import numpy as np
+import PIL.Image
+import psutil
+import torch
 from metrics import metric_main
+from torch.utils.data import WeightedRandomSampler
+from torch_utils import misc, training_stats
+from torch_utils.ops import conv2d_gradfix, grid_sample_gradfix
 
 #----------------------------------------------------------------------------
 
@@ -134,8 +133,10 @@ def training_loop(
     if rank == 0:
         print('Loading training set...')
     training_set = dnnlib.util.construct_class_by_name(**training_set_kwargs) # subclass of training.dataset.Dataset
-    training_set_sampler = misc.InfiniteSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed)
-    training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, sampler=training_set_sampler, batch_size=batch_size//num_gpus, **data_loader_kwargs))
+    weights = [training_set.get_weight(i) for i in range(len(training_set))]  # Extract weights from dataset
+    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)  # Create a weighted sampler
+    # training_set_sampler = misc.InfiniteSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed) #original sampler
+    training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, sampler=sampler, batch_size=batch_size//num_gpus, **data_loader_kwargs)) # with this, higher weight samples are more likely to appear in each batch
     if rank == 0:
         print()
         print('Num images: ', len(training_set))
