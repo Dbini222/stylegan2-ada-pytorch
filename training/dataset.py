@@ -6,13 +6,14 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-import os
-import numpy as np
-import zipfile
-import PIL.Image
 import json
-import torch
+import os
+import zipfile
+
 import dnnlib
+import numpy as np
+import PIL.Image
+import torch
 
 try:
     import pyspng
@@ -35,6 +36,7 @@ class Dataset(torch.utils.data.Dataset):
         self._use_labels = use_labels
         self._raw_labels = None
         self._label_shape = None
+        self._weight = None
 
         # Apply max_size.
         self._raw_idx = np.arange(self._raw_shape[0], dtype=np.int64)
@@ -48,9 +50,19 @@ class Dataset(torch.utils.data.Dataset):
             self._raw_idx = np.tile(self._raw_idx, 2)
             self._xflip = np.concatenate([self._xflip, np.ones_like(self._xflip)])
 
+    def get_raw_weight(self):
+        if self._weight is None:
+            _, self._weight = self._load_raw_metadata() if self._use_labels else None
+            if self._weight is None:
+                self._weight = np.zeros([self._raw_shape[0], 0], dtype=np.float32)
+            assert isinstance(self._weight, np.ndarray)
+            assert self._weight.shape[0] == self._raw_shape[0]
+            assert self._weight.dtype in [np.float32]
+        return self._weight
+
     def _get_raw_labels(self):
         if self._raw_labels is None:
-            self._raw_labels = self._load_raw_labels() if self._use_labels else None
+            self._raw_labels, _ = self._load_raw_metadata() if self._use_labels else None
             if self._raw_labels is None:
                 self._raw_labels = np.zeros([self._raw_shape[0], 0], dtype=np.float32)
             assert isinstance(self._raw_labels, np.ndarray)
@@ -68,6 +80,9 @@ class Dataset(torch.utils.data.Dataset):
         raise NotImplementedError
 
     def _load_raw_labels(self): # to be overridden by subclass
+        raise NotImplementedError
+    
+    def _load_raw_weight(self): # to be overridden by subclass
         raise NotImplementedError
 
     def __getstate__(self):
@@ -99,6 +114,10 @@ class Dataset(torch.utils.data.Dataset):
             onehot[label] = 1
             label = onehot
         return label.copy()
+    
+    def get_weight(self, idx):
+        weight = self.get_raw_weight()[self._raw_idx[idx]]
+        return weight.copy()
 
     def get_details(self, idx):
         d = dnnlib.EasyDict()
@@ -219,18 +238,26 @@ class ImageFolderDataset(Dataset):
         image = image.transpose(2, 0, 1) # HWC => CHW
         return image
 
-    def _load_raw_labels(self):
+    def _load_raw_metadata(self):
         fname = 'dataset.json'
         if fname not in self._all_fnames:
             return None
         with self._open_file(fname) as f:
-            labels = json.load(f)['labels']
+            data = json.load(f)
+            labels = data['labels']
+            weights = data['weights']
         if labels is None:
             return None
+        if weights is None:
+            return None
         labels = dict(labels)
+        weights = dict(weights)
         labels = [labels[fname.replace('\\', '/')] for fname in self._image_fnames]
         labels = np.array(labels)
         labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
-        return labels
+        weights = [weights[fname.replace('\\', '/')] for fname in self._image_fnames]
+        weights = np.array(weights)
+        weights = weights.astype({1: np.float32}[weights.ndim])
+        return labels, weights
 
 #----------------------------------------------------------------------------
