@@ -444,6 +444,36 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--allow-tf32', help='Allow PyTorch to use TF32 internally', type=bool, metavar='BOOL')
 @click.option('--workers', help='Override number of DataLoader workers', type=int, metavar='INT')
 
+
+# def objective(trial):
+#     # Suggest parameters
+#     lr = trial.suggest_loguniform('lr', 1e-5, 1e-3)
+#     beta1 = trial.suggest_uniform('beta1', 0.0, 0.999)
+#     batch_size = trial.suggest_categorical('batch_size', [16, 32, 64])
+
+#     # Prepare arguments based on trial suggestions
+#     config_kwargs = {
+#         'gpus': 1,
+#         'data': '~/datasets/mydataset.zip',
+#         'cfg': 'stylegan2',
+#         'batch': batch_size,
+#         'aug': 'ada',
+#         'lr': lr,
+#         'beta1': beta1,
+#         # Add other necessary parameters
+#     }
+
+#     # Convert CLI arguments to Optuna compatible format
+#     run_desc, args = setup_training_loop_kwargs(**config_kwargs)
+#     args['lr'] = lr
+#     args['beta1'] = beta1
+#     args['batch_size'] = batch_size
+
+#     # Call the existing training setup
+#     run_desc, args = setup_training_loop_kwargs(**config_kwargs)
+#     result = subprocess_fn(0, args)  # Assume a function that can run training and return a metric value
+#     return result  # The metric you want to minimize or maximize
+
 def main(ctx, outdir, dry_run, **config_kwargs):
     """Train a GAN using the techniques described in the paper
     "Training Generative Adversarial Networks with Limited Data".
@@ -542,6 +572,10 @@ def main(ctx, outdir, dry_run, **config_kwargs):
             subprocess_fn(rank=0, args=args, temp_dir=temp_dir)
         else:
             torch.multiprocessing.spawn(fn=subprocess_fn, args=(args, temp_dir), nprocs=args.num_gpus)
+    
+    # study = optuna.create_study(direction='minimize')
+    # study.optimize(objective, n_trials=50)
+    # print('Best trial:', study.best_trial.params)
 
 #----------------------------------------------------------------------------
 

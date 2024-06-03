@@ -8,8 +8,7 @@
 
 import numpy as np
 import torch
-from torch_utils import training_stats
-from torch_utils import misc
+from torch_utils import misc, training_stats
 from torch_utils.ops import conv2d_gradfix
 
 #----------------------------------------------------------------------------
@@ -47,14 +46,14 @@ class StyleGAN2Loss(Loss):
             img = self.G_synthesis(ws)
         return img, ws
 
-    def run_D(self, img, c, sync):
+    def run_D(self, img, c,m, sync):
         if self.augment_pipe is not None:
             img = self.augment_pipe(img)
         with misc.ddp_sync(self.D, sync):
-            logits = self.D(img, c)
+            logits = self.D(img, c,m)
         return logits
 
-    def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, sync, gain):
+    def accumulate_gradients(self, phase, real_img, real_c, real_m, gen_m, gen_z, gen_c, sync, gain):
         assert phase in ['Gmain', 'Greg', 'Gboth', 'Dmain', 'Dreg', 'Dboth']
         do_Gmain = (phase in ['Gmain', 'Gboth'])
         do_Dmain = (phase in ['Dmain', 'Dboth'])
@@ -64,8 +63,8 @@ class StyleGAN2Loss(Loss):
         # Gmain: Maximize logits for generated images.
         if do_Gmain:
             with torch.autograd.profiler.record_function('Gmain_forward'):
-                gen_img, _gen_ws = self.run_G(gen_z, gen_c, sync=(sync and not do_Gpl)) # May get synced by Gpl.
-                gen_logits = self.run_D(gen_img, gen_c, sync=False)
+                gen_img, _gen_ws = self.run_G(gen_z, gen_c, gen_m,sync=(sync and not do_Gpl)) # May get synced by Gpl.
+                gen_logits = self.run_D(gen_img, gen_c, gen_m, sync=False)
                 training_stats.report('Loss/scores/fake', gen_logits)
                 training_stats.report('Loss/signs/fake', gen_logits.sign())
                 loss_Gmain = torch.nn.functional.softplus(-gen_logits) # -log(sigmoid(gen_logits))

@@ -38,7 +38,7 @@ def num_range(s: str) -> List[int]:
 @click.option('--network', 'network_pkl', help='Network pickle filename', required=True)
 @click.option('--seeds', type=num_range, help='List of random seeds')
 @click.option('--trunc', 'truncation_psi', type=float, help='Truncation psi', default=1, show_default=True)
-@click.option('--label', 'raw_label', type=num_range, help='Raw label') #for multilabel classification
+@click.option('--label', 'raw_label', type=str, help='Comma-separated multilabels followed by complexity index, i.e. "[[1010101010101],1]')
 @click.option('--class', 'class_idx', type=int, help='Class label (unconditional if not specified)')
 @click.option('--noise-mode', help='Noise mode', type=click.Choice(['const', 'random', 'none']), default='const', show_default=True)
 @click.option('--projected-w', help='Projection result file', type=str, metavar='FILE')
@@ -51,7 +51,7 @@ def generate_images(
     noise_mode: str,
     outdir: str,
     class_idx: Optional[int],
-    raw_label: Optional[List[int]],
+    raw_label: Optional[str],
     projected_w: Optional[str]
 ):
     """Generate images using pretrained network pickle.
@@ -115,7 +115,13 @@ def generate_images(
         if class_idx is not None:
             label[:, class_idx] = 1
         if raw_label is not None:
-            label = torch.unsqueeze(torch.tensor(raw_label,device=device),0)
+            # Convert comma-separated string to tensor
+            label_values = list(map(int, raw_label.split(',')))
+            color_vector = label_values[:-1]  # Last value is not part of the binary vector
+            complexity_index = label_values[-1]
+            label_tensor = torch.tensor([color_vector], dtype=torch.float32, device=device)
+            label_tensor = torch.cat((label_tensor, torch.tensor([[complexity_index]], dtype=torch.float32, device=device)), dim=1)
+
     else:
         if class_idx is not None:
             print ('warn: --class=lbl ignored when running on an unconditional network')
