@@ -33,6 +33,9 @@ class StyleGAN2Loss(Loss):
         self.pl_decay = pl_decay
         self.pl_weight = pl_weight
         self.pl_mean = torch.zeros([], device=device)
+        self.cumulative_loss_G = 0
+        self.cumulative_loss_D = 0
+        self.loss_count = 0
 
     def run_G(self, z, c, sync):
         with misc.ddp_sync(self.G_mapping, sync):
@@ -55,6 +58,11 @@ class StyleGAN2Loss(Loss):
 
     def accumulate_gradients(self, phase, real_img, real_c, real_m, gen_m, gen_z, gen_c, sync, gain):
         assert phase in ['Gmain', 'Greg', 'Gboth', 'Dmain', 'Dreg', 'Dboth']
+        loss_Gmain = 0
+        loss_Dreal = 0
+        loss_Dgen = 0
+        loss_Gpl = 0
+        loss_Dr1 = 0
         do_Gmain = (phase in ['Gmain', 'Gboth'])
         do_Dmain = (phase in ['Dmain', 'Dboth'])
         do_Gpl   = (phase in ['Greg', 'Gboth']) and (self.pl_weight != 0)
@@ -128,5 +136,21 @@ class StyleGAN2Loss(Loss):
 
             with torch.autograd.profiler.record_function(name + '_backward'):
                 (real_logits * 0 + loss_Dreal + loss_Dr1).mean().mul(gain).backward()
+
+        self.cumulative_loss_G += loss_Gmain.item() + (loss_Gpl.item() if do_Gpl else 0)
+        self.cumulative_loss_D += loss_Dreal.item() + loss_Dgen.item() + (loss_Dr1.item() if do_Dr1 else 0)
+        self.loss_count += 1
+
+        return loss_Gmain, loss_Dreal, loss_Dgen
+
+    def get_losses(self, reset=True):
+        avg_loss_G = self.cumulative_loss_G / self.loss_count
+        avg_loss_D = self.cumulative_loss_D / self.loss_count
+        if reset:
+            self.cumulative_loss_G = 0
+            self.cumulative_loss_D = 0
+            self.loss_count = 0
+        return avg_loss_G, avg_loss_D
+
 
 #----------------------------------------------------------------------------

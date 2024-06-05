@@ -8,7 +8,6 @@
 
 """Train a GAN using the techniques described in the paper
 "Training Generative Adversarial Networks with Limited Data"."""
-
 import json
 import os
 import re
@@ -17,6 +16,7 @@ import tempfile
 
 import click
 import dnnlib
+import optuna
 import torch
 from FirestoreDataset import FirestoreDataset
 from metrics import metric_main
@@ -389,7 +389,8 @@ def subprocess_fn(rank, args, temp_dir):
         custom_ops.verbosity = 'none'
 
     # Execute training loop.
-    training_loop.training_loop(rank=rank, **args)
+    loss=  training_loop.training_loop(rank=rank, **args)
+    return loss
 
 #----------------------------------------------------------------------------
 
@@ -573,9 +574,44 @@ def main(ctx, outdir, dry_run, **config_kwargs):
         else:
             torch.multiprocessing.spawn(fn=subprocess_fn, args=(args, temp_dir), nprocs=args.num_gpus)
     
-    # study = optuna.create_study(direction='minimize')
-    # study.optimize(objective, n_trials=50)
-    # print('Best trial:', study.best_trial.params)
+def objective(trial):
+    # Define the range of hyperparameters
+    batch_size = trial.suggest_categorical('batch_size', [16, 32, 64])
+    learning_rate = trial.suggest_loguniform('learning_rate', 1e-5, 1e-2)
+    beta1 = trial.suggest_uniform('beta1', 0.0, 0.9)
+
+    # Set up the training configuration using suggested values
+    config_kwargs = {
+        'batch': batch_size,
+        'G_opt_kwargs': {'lr': learning_rate, 'betas': [beta1, 0.999]},
+        'D_opt_kwargs': {'lr': learning_rate, 'betas': [beta1, 0.999]},
+    }
+    
+    # Other fixed settings
+    fixed_kwargs = {
+        'outdir': 'path_to_output_dir',
+        'data': 'path_to_training_data',
+        'gpus': 1,
+        'cfg': 'stylegan2',
+        'metrics': None,
+    }
+
+    # Merge the two dictionaries
+    config_kwargs.update(fixed_kwargs)
+
+    # Training setup function that also executes training and returns a metric (e.g., FID)
+    run_desc, args = setup_training_loop_kwargs(**config_kwargs)
+    # Assume subprocess_fn returns the evaluation metric that we want to minimize
+    result = subprocess_fn(0, args, '/tmp')  # Simplified call
+    return result
+
+def main():
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=50)
+    print('Best trial:', study.best_trial.params)
+
+if __name__ == "__main__":
+    main()
 
 #----------------------------------------------------------------------------
 
