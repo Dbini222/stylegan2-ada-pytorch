@@ -8,21 +8,19 @@
 
 """Train a GAN using the techniques described in the paper
 "Training Generative Adversarial Networks with Limited Data"."""
-import json
-import os
-import re
-import subprocess
-import tempfile
 
+import os
 import click
-import dnnlib
-import optuna
+import re
+import json
+import tempfile
 import torch
-from FirestoreDataset import FirestoreDataset
-from metrics import metric_main
-from torch.utils.data import DataLoader, WeightedRandomSampler
-from torch_utils import custom_ops, training_stats
+import dnnlib
+
 from training import training_loop
+from metrics import metric_main
+from torch_utils import training_stats
+from torch_utils import custom_ops
 
 #----------------------------------------------------------------------------
 
@@ -30,13 +28,6 @@ class UserError(Exception):
     pass
 
 #----------------------------------------------------------------------------
-#check to see if the images are correctly downloaded
-def prepare_dataset(data_dir):
-    if not os.path.exists(data_dir) or not os.listdir(data_dir):
-        print(f"No data found in {data_dir}. Running the preparation script...")
-        subprocess.run(['python', 'download_and_prepare.py', '--data-dir', data_dir, '--metadata-collection', metadata_collection], check=True)
-    else:
-        print(f"Data ready in {data_dir}")
 
 def setup_training_loop_kwargs(
     # General options (not included in desc).
@@ -389,8 +380,7 @@ def subprocess_fn(rank, args, temp_dir):
         custom_ops.verbosity = 'none'
 
     # Execute training loop.
-    loss=  training_loop.training_loop(rank=rank, **args)
-    return loss
+    training_loop.training_loop(rank=rank, **args)
 
 #----------------------------------------------------------------------------
 
@@ -445,36 +435,6 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--allow-tf32', help='Allow PyTorch to use TF32 internally', type=bool, metavar='BOOL')
 @click.option('--workers', help='Override number of DataLoader workers', type=int, metavar='INT')
 
-
-# def objective(trial):
-#     # Suggest parameters
-#     lr = trial.suggest_loguniform('lr', 1e-5, 1e-3)
-#     beta1 = trial.suggest_uniform('beta1', 0.0, 0.999)
-#     batch_size = trial.suggest_categorical('batch_size', [16, 32, 64])
-
-#     # Prepare arguments based on trial suggestions
-#     config_kwargs = {
-#         'gpus': 1,
-#         'data': '~/datasets/mydataset.zip',
-#         'cfg': 'stylegan2',
-#         'batch': batch_size,
-#         'aug': 'ada',
-#         'lr': lr,
-#         'beta1': beta1,
-#         # Add other necessary parameters
-#     }
-
-#     # Convert CLI arguments to Optuna compatible format
-#     run_desc, args = setup_training_loop_kwargs(**config_kwargs)
-#     args['lr'] = lr
-#     args['beta1'] = beta1
-#     args['batch_size'] = batch_size
-
-#     # Call the existing training setup
-#     run_desc, args = setup_training_loop_kwargs(**config_kwargs)
-#     result = subprocess_fn(0, args)  # Assume a function that can run training and return a metric value
-#     return result  # The metric you want to minimize or maximize
-
 def main(ctx, outdir, dry_run, **config_kwargs):
     """Train a GAN using the techniques described in the paper
     "Training Generative Adversarial Networks with Limited Data".
@@ -520,8 +480,6 @@ def main(ctx, outdir, dry_run, **config_kwargs):
       <PATH or URL>  Custom network pickle.
     """
     dnnlib.util.Logger(should_flush=True)
-    #prepare dataset
-    prepare_dataset(config_kwargs['data'])
 
     # Setup training options.
     try:
@@ -573,45 +531,6 @@ def main(ctx, outdir, dry_run, **config_kwargs):
             subprocess_fn(rank=0, args=args, temp_dir=temp_dir)
         else:
             torch.multiprocessing.spawn(fn=subprocess_fn, args=(args, temp_dir), nprocs=args.num_gpus)
-    
-def objective(trial):
-    # Define the range of hyperparameters
-    batch_size = trial.suggest_categorical('batch_size', [16, 32, 64])
-    learning_rate = trial.suggest_loguniform('learning_rate', 1e-5, 1e-2)
-    beta1 = trial.suggest_uniform('beta1', 0.0, 0.9)
-
-    # Set up the training configuration using suggested values
-    config_kwargs = {
-        'batch': batch_size,
-        'G_opt_kwargs': {'lr': learning_rate, 'betas': [beta1, 0.999]},
-        'D_opt_kwargs': {'lr': learning_rate, 'betas': [beta1, 0.999]},
-    }
-    
-    # Other fixed settings
-    fixed_kwargs = {
-        'outdir': 'path_to_output_dir',
-        'data': 'path_to_training_data',
-        'gpus': 1,
-        'cfg': 'stylegan2',
-        'metrics': None,
-    }
-
-    # Merge the two dictionaries
-    config_kwargs.update(fixed_kwargs)
-
-    # Training setup function that also executes training and returns a metric (e.g., FID)
-    run_desc, args = setup_training_loop_kwargs(**config_kwargs)
-    # Assume subprocess_fn returns the evaluation metric that we want to minimize
-    result = subprocess_fn(0, args, '/tmp')  # Simplified call
-    return result
-
-def main():
-    study = optuna.create_study(direction='minimize')
-    study.optimize(objective, n_trials=50)
-    print('Best trial:', study.best_trial.params)
-
-if __name__ == "__main__":
-    main()
 
 #----------------------------------------------------------------------------
 

@@ -58,10 +58,11 @@ def open_image_folder(source_dir, *, max_images: Optional[int]):
     if os.path.isfile(meta_fname):
         with open(meta_fname, 'r') as file:
             labels = json.load(file)['labels']
-            if labels is not None:
-                labels = { x[0]: x[1] for x in labels }
-            else:
-                labels = {}
+            weights = json.load(file){'weights'}
+            # if labels is not None:
+            #     labels = { x[0]: x[1] for x in labels }
+            # else:
+            #     labels = {}
 
     max_idx = maybe_min(len(input_images), max_images)
 
@@ -70,7 +71,7 @@ def open_image_folder(source_dir, *, max_images: Optional[int]):
             arch_fname = os.path.relpath(fname, source_dir)
             arch_fname = arch_fname.replace('\\', '/')
             img = np.array(PIL.Image.open(fname))
-            yield dict(img=img, label=labels.get(arch_fname))
+            yield dict(img=img, label=labels.get("images/" + arch_fname), weight=weights.get("images/" + arch_fname))
             if idx >= max_idx-1:
                 break
     return max_idx, iterate_images()
