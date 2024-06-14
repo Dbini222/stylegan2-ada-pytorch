@@ -53,7 +53,15 @@ class Dataset(torch.utils.data.Dataset):
     def _get_raw_labels(self):
         if self._raw_labels is None:
             self._raw_labels = self._load_raw_labels() if self._use_labels else None
+            self._raw_labels = self._load_raw_labels() if self._use_labels else None
             if self._raw_labels is None:
+                self._raw_labels = np.zeros([self._raw_shape[0], 0], dtype=np.float32)
+            assert isinstance(self._raw_labels, np.ndarray)
+            assert self._raw_labels.shape[0] == self._raw_shape[0]
+            assert self._raw_labels.dtype in [np.float32, np.int64]
+            if self._raw_labels.dtype == np.int64:
+                assert self._raw_labels.ndim == 1
+                assert np.all(self._raw_labels >= 0)
                 self._raw_labels = np.zeros([self._raw_shape[0], 0], dtype=np.float32)
             assert isinstance(self._raw_labels, np.ndarray)
             assert self._raw_labels.shape[0] == self._raw_shape[0]
@@ -93,8 +101,15 @@ class Dataset(torch.utils.data.Dataset):
             assert image.ndim == 3 # CHW
             image = image[:, :, ::-1]
         return image.copy(), self.get_label(idx)
+        return image.copy(), self.get_label(idx)
 
     def get_label(self, idx):
+        label = self._get_raw_labels()[self._raw_idx[idx]]
+        if label.dtype == np.int64:
+            onehot = np.zeros(self.label_shape, dtype=np.float32)
+            onehot[label] = 1
+            label = onehot
+        return label.copy()
         label = self._get_raw_labels()[self._raw_idx[idx]]
         if label.dtype == np.int64:
             onehot = np.zeros(self.label_shape, dtype=np.float32)
@@ -179,6 +194,10 @@ class ImageFolderDataset(Dataset):
         self.labels = self._load_raw_labels()
         self.weights = self._load_raw_weights()
         self.sampler = WeightedRandomSampler(self.weights, num_samples=len(self.weights), replacement=True)
+        
+        self.labels = self._load_raw_labels()
+        self.weights = self._load_raw_weights()
+        self.sampler = WeightedRandomSampler(self.weights, num_samples=len(self.weights), replacement=True)
 
         name = os.path.splitext(os.path.basename(self._path))[0]
         raw_shape = [len(self._image_fnames)] + list(self._load_raw_image(0).shape)
@@ -227,6 +246,9 @@ class ImageFolderDataset(Dataset):
     
 
     def _load_raw_labels(self):
+    
+
+    def _load_raw_labels(self):
         fname = 'dataset.json'
         if fname not in self._all_fnames:
             return None
@@ -248,12 +270,34 @@ class ImageFolderDataset(Dataset):
     def _load_raw_weights(self):
         fname = 'dataset.json'
         if fname not in self._all_fnames:
+        if labels is None or weights is None:
             return None
+        labels = dict(labels)
+        labels = [labels[fname.replace('\\', '/')] for fname in self._image_fnames]
+        labels = np.array(labels)
+        labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
+        weights = dict(weights)
+        weights = [weights[fname.replace('\\', '/')] for fname in self._image_fnames]
+        weights = np.array(weights, dtype=np.float32)
+        return labels
+    
+    def _load_raw_weights(self):
+        fname = 'dataset.json'
+        if fname not in self._all_fnames:
+            return None
+        with self._open_file(fname) as f:
+            data = json.load(f)
+            weights = data['weights']
         with self._open_file(fname) as f:
             data = json.load(f)
             weights = data['weights']
         if weights is None:
             return None
+        weights = dict(weights)
+        weights = [weights[fname.replace('\\', '/')] for fname in self._image_fnames]
+        weights = np.array(weights, dtype=np.float32)
+        return weights
+
         weights = dict(weights)
         weights = [weights[fname.replace('\\', '/')] for fname in self._image_fnames]
         weights = np.array(weights, dtype=np.float32)
