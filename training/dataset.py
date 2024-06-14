@@ -8,14 +8,13 @@
 
 import json
 import os
-import shutil
 import zipfile
-from pathlib import Path
 
 import dnnlib
 import numpy as np
 import PIL.Image
 import torch
+from torch.utils.data import WeightedRandomSampler
 
 try:
     import pyspng
@@ -38,8 +37,6 @@ class Dataset(torch.utils.data.Dataset):
         self._use_labels = use_labels
         self._raw_labels = None
         self._label_shape = None
-        self._weight = None
-        self.num_classes = 3 # simple, normal, complex
 
         # Apply max_size.
         self._raw_idx = np.arange(self._raw_shape[0], dtype=np.int64)
@@ -53,31 +50,18 @@ class Dataset(torch.utils.data.Dataset):
             self._raw_idx = np.tile(self._raw_idx, 2)
             self._xflip = np.concatenate([self._xflip, np.ones_like(self._xflip)])
 
-    def get_raw_weight(self):
-        if self._weight is None:
-            _, self._weight = self._load_raw_metadata() if self._use_labels else None
-            if self._weight is None:
-                self._weight = np.zeros([self._raw_shape[0], 0], dtype=np.float32)
-            assert isinstance(self._weight, np.ndarray)
-            assert self._weight.shape[0] == self._raw_shape[0]
-            assert self._weight.dtype in [np.float32]
-        return self._weight
-
     def _get_raw_labels(self):
         if self._raw_labels is None:
-            # assume load_raw_metadata is in correct form
-            self._raw_labels, _ = self._load_raw_metadata() if self._use_labels else (None, None)
+            self._raw_labels = self._load_raw_labels() if self._use_labels else None
             if self._raw_labels is None:
-                # Initialize with a default value if no labels are found
-                self._raw_labels = np.zeros((self._raw_shape[0], 0), dtype=np.float32)
-            else:
-                # Ensure the data structure is correct
-                assert isinstance(self._raw_labels, list)
-                # Convert list of lists into a structured numpy array if necessary
-                dtype = [('multilabel_vector', np.float32, (len(self._raw_labels[0][0]),)), ('multiclass_label', np.int32)]
-                self._raw_labels = np.array(self._raw_labels, dtype=dtype)
+                self._raw_labels = np.zeros([self._raw_shape[0], 0], dtype=np.float32)
+            assert isinstance(self._raw_labels, np.ndarray)
+            assert self._raw_labels.shape[0] == self._raw_shape[0]
+            assert self._raw_labels.dtype in [np.float32, np.int64]
+            if self._raw_labels.dtype == np.int64:
+                assert self._raw_labels.ndim == 1
+                assert np.all(self._raw_labels >= 0)
         return self._raw_labels
-
 
     def close(self): # to be overridden by subclass
         pass
@@ -86,9 +70,6 @@ class Dataset(torch.utils.data.Dataset):
         raise NotImplementedError
 
     def _load_raw_labels(self): # to be overridden by subclass
-        raise NotImplementedError
-    
-    def _load_raw_weight(self): # to be overridden by subclass
         raise NotImplementedError
 
     def __getstate__(self):
@@ -111,19 +92,15 @@ class Dataset(torch.utils.data.Dataset):
         if self._xflip[idx]:
             assert image.ndim == 3 # CHW
             image = image[:, :, ::-1]
-        label_vector, class_label = self.get_label(idx)
-        onehot_multiclass = np.zeros((self.num_classes,))
-        onehot_multiclass[class_label] = 1
-        return image.copy(), (label_vector.copy(), onehot_multiclass)
+        return image.copy(), self.get_label(idx)
 
     def get_label(self, idx):
-        label_entry = self._get_raw_labels()[self._raw_idx[idx]]
-        multilabel_vector, multiclass_label = label_entry
-        return multilabel_vector, multiclass_label
-    
-    def get_weight(self, idx):
-        weight = self.get_raw_weight()[self._raw_idx[idx]]
-        return weight.copy()
+        label = self._get_raw_labels()[self._raw_idx[idx]]
+        if label.dtype == np.int64:
+            onehot = np.zeros(self.label_shape, dtype=np.float32)
+            onehot[label] = 1
+            label = onehot
+        return label.copy()
 
     def get_details(self, idx):
         d = dnnlib.EasyDict()
@@ -198,6 +175,10 @@ class ImageFolderDataset(Dataset):
         self._image_fnames = sorted(fname for fname in self._all_fnames if self._file_ext(fname) in PIL.Image.EXTENSION)
         if len(self._image_fnames) == 0:
             raise IOError('No image files found in the specified path')
+        
+        self.labels = self._load_raw_labels()
+        self.weights = self._load_raw_weights()
+        self.sampler = WeightedRandomSampler(self.weights, num_samples=len(self.weights), replacement=True)
 
         name = os.path.splitext(os.path.basename(self._path))[0]
         raw_shape = [len(self._image_fnames)] + list(self._load_raw_image(0).shape)
@@ -243,8 +224,9 @@ class ImageFolderDataset(Dataset):
             image = image[:, :, np.newaxis] # HW => HWC
         image = image.transpose(2, 0, 1) # HWC => CHW
         return image
+    
 
-    def _load_raw_metadata(self):
+    def _load_raw_labels(self):
         fname = 'dataset.json'
         if fname not in self._all_fnames:
             return None
@@ -252,85 +234,30 @@ class ImageFolderDataset(Dataset):
             data = json.load(f)
             labels = data['labels']
             weights = data['weights']
-        if labels is None:
+        if labels is None or weights is None:
             return None
+        labels = dict(labels)
+        labels = [labels[fname.replace('\\', '/')] for fname in self._image_fnames]
+        labels = np.array(labels)
+        labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
+        weights = dict(weights)
+        weights = [weights[fname.replace('\\', '/')] for fname in self._image_fnames]
+        weights = np.array(weights, dtype=np.float32)
+        return labels
+    
+    def _load_raw_weights(self):
+        fname = 'dataset.json'
+        if fname not in self._all_fnames:
+            return None
+        with self._open_file(fname) as f:
+            data = json.load(f)
+            weights = data['weights']
         if weights is None:
             return None
-        parsed_labels = []
-        parsed_weights = []
-        #below is to handle multi label and multi classification
-        for img_path, label in labels.items():
-            multilabel_vector, multiclass_label = label[0], label[1]
-            # Store multilabel as numpy array and multiclass as integer
-            parsed_labels.append([np.array(multilabel_vector, dtype=np.float32), multiclass_label])
-            parsed_weights.append(weights[img_path])
+        weights = dict(weights)
+        weights = [weights[fname.replace('\\', '/')] for fname in self._image_fnames]
+        weights = np.array(weights, dtype=np.float32)
+        return weights
 
-        parsed_weights = np.array(parsed_weights, dtype=np.float32)
-        return parsed_labels, parsed_weights
-        # labels = dict(labels)
-        # weights = dict(weights)
-        # labels = [labels[fname.replace('\\', '/')] for fname in self._image_fnames]
-        # labels = np.array(labels)
-        # labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
-        # weights = [weights[fname.replace('\\', '/')] for fname in self._image_fnames]
-        # weights = np.array(weights)
-        # weights = weights.astype({1: np.float32}[weights.ndim])
-        # return labels, weights
 
 #----------------------------------------------------------------------------
-#Testing changes
-    
-# Mock the methods from your dataset class that depend on actual file IO
-def mock_open_file(self, fname):
-    if 'json' in fname:
-        return open('dataset.json', 'r')  # Assume dataset.json is in the current directory for simplicity
-    raise FileNotFoundError
-
-def mock_load_raw_image(self, idx):
-    # Return a dummy image array (3-channel RGB, 64x64)
-    return np.zeros((3, 64, 64), dtype=np.uint8)
-
-# Replace file I/O methods with mocks
-ImageFolderDataset._open_file = mock_open_file
-ImageFolderDataset._load_raw_image = mock_load_raw_image
-
-# Assuming ImageFolderDataset is already defined and imported
-# if __name__ == "__main__":
-#     data = {
-#         "labels": {
-#             "images/img1.png": [[1, 0, 0, 1], 0],
-#             "images/img2.png": [[0, 1, 1, 0], 1],
-#             "images/img3.png": [[1, 1, 0, 1], 2],
-#             "images/img4.png": [[0, 0, 1, 1], 0],
-#             "images/img5.png": [[1, 0, 1, 0], 1]
-#         },
-#         "weights": {
-#             "images/img1.png": 0.5,
-#             "images/img2.png": 0.7,
-#             "images/img3.png": 0.9,
-#             "images/img4.png": 0.4,
-#             "images/img5.png": 0.6
-#         }
-#     }
-
-#     with open('dataset.json', 'w') as f:
-#         json.dump(data, f, indent=4)
-
-#     # Setup test environment
-#     dataset_path = Path('test_dataset')
-#     dataset_path.mkdir(exist_ok=True)
-#     (dataset_path / 'img1.png').touch()
-#     (dataset_path / 'img2.png').touch()
-#     (dataset_path / 'img3.png').touch()
-#     (dataset_path / 'img4.png').touch()
-
-#     # Initialize the dataset
-#     dataset = ImageFolderDataset(path=str(dataset_path), use_labels=True)
-
-#     # Test the label loading and parsing
-#     for idx in range(len(dataset)):
-#         image, (multilabel_vector, multiclass_label) = dataset[idx]
-#         print(f"Image {idx + 1}: Multilabel: {multilabel_vector}, Multiclass: {multiclass_label}")
-
-#     # Clean up
-#     shutil.rmtree(dataset_path)

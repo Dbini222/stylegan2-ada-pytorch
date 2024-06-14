@@ -8,20 +8,18 @@
 
 """Train a GAN using the techniques described in the paper
 "Training Generative Adversarial Networks with Limited Data"."""
+
 import json
 import os
 import re
-import subprocess
 import tempfile
 
 import click
 import dnnlib
-import optuna
 import torch
-from FirestoreDataset import FirestoreDataset
 from metrics import metric_main
-from torch.utils.data import DataLoader, WeightedRandomSampler
-from torch_utils import custom_ops, training_stats
+from torch.utils.data import WeightedRandomSampler
+from torch_utils import CustomEncoder, custom_ops, training_stats
 from training import training_loop
 
 #----------------------------------------------------------------------------
@@ -30,13 +28,6 @@ class UserError(Exception):
     pass
 
 #----------------------------------------------------------------------------
-#check to see if the images are correctly downloaded
-def prepare_dataset(data_dir):
-    if not os.path.exists(data_dir) or not os.listdir(data_dir):
-        print(f"No data found in {data_dir}. Running the preparation script...")
-        subprocess.run(['python', 'download_and_prepare.py', '--data-dir', data_dir, '--metadata-collection', metadata_collection], check=True)
-    else:
-        print(f"Data ready in {data_dir}")
 
 def setup_training_loop_kwargs(
     # General options (not included in desc).
@@ -114,9 +105,21 @@ def setup_training_loop_kwargs(
     assert data is not None
     assert isinstance(data, str)
     args.training_set_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False)
-    args.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=3, prefetch_factor=2)
+    args.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=3, prefetch_factor=2) #commented out for custom weighting
     try:
         training_set = dnnlib.util.construct_class_by_name(**args.training_set_kwargs) # subclass of training.dataset.Dataset
+        if training_set.sampler:
+            print("using weights")
+            args.data_loader_kwargs.update({
+                'sampler': training_set.sampler,
+                'shuffle': False  # It's important to disable shuffle when using a sampler
+            })
+        else:
+            # Optionally handle cases where no sampler is available
+            print("Not using weights")
+            args.data_loader_kwargs.update({
+                'shuffle': True
+            })
         args.training_set_kwargs.resolution = training_set.resolution # be explicit about resolution
         args.training_set_kwargs.use_labels = training_set.has_labels # be explicit about labels
         args.training_set_kwargs.max_size = len(training_set) # be explicit about dataset size
@@ -163,7 +166,7 @@ def setup_training_loop_kwargs(
     cfg_specs = {
         'auto':      dict(ref_gpus=-1, kimg=25000,  mb=-1, mbstd=-1, fmaps=-1,  lrate=-1,     gamma=-1,   ema=-1,  ramp=0.05, map=2), # Populated dynamically based on resolution and GPU count.
         'stylegan2': dict(ref_gpus=8,  kimg=25000,  mb=32, mbstd=4,  fmaps=1,   lrate=0.002,  gamma=10,   ema=10,  ramp=None, map=8), # Uses mixed-precision, unlike the original StyleGAN2.
-        'paper256':  dict(ref_gpus=8,  kimg=25000,  mb=64, mbstd=8,  fmaps=0.5, lrate=0.0025, gamma=1,    ema=20,  ramp=None, map=8),
+        'paper256':  dict(ref_gpus=8,  kimg=10000,  mb=64, mbstd=8,  fmaps=0.5, lrate=0.0025, gamma=1,    ema=20,  ramp=None, map=8),
         'paper512':  dict(ref_gpus=8,  kimg=25000,  mb=64, mbstd=8,  fmaps=1,   lrate=0.0025, gamma=0.5,  ema=20,  ramp=None, map=8),
         'paper1024': dict(ref_gpus=8,  kimg=25000,  mb=32, mbstd=4,  fmaps=1,   lrate=0.002,  gamma=2,    ema=10,  ramp=None, map=8),
         'cifar':     dict(ref_gpus=2,  kimg=100000, mb=64, mbstd=32, fmaps=1,   lrate=0.0025, gamma=0.01, ema=500, ramp=0.05, map=2),
@@ -389,8 +392,7 @@ def subprocess_fn(rank, args, temp_dir):
         custom_ops.verbosity = 'none'
 
     # Execute training loop.
-    loss=  training_loop.training_loop(rank=rank, **args)
-    return loss
+    training_loop.training_loop(rank=rank, **args)
 
 #----------------------------------------------------------------------------
 
@@ -445,36 +447,6 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--allow-tf32', help='Allow PyTorch to use TF32 internally', type=bool, metavar='BOOL')
 @click.option('--workers', help='Override number of DataLoader workers', type=int, metavar='INT')
 
-
-# def objective(trial):
-#     # Suggest parameters
-#     lr = trial.suggest_loguniform('lr', 1e-5, 1e-3)
-#     beta1 = trial.suggest_uniform('beta1', 0.0, 0.999)
-#     batch_size = trial.suggest_categorical('batch_size', [16, 32, 64])
-
-#     # Prepare arguments based on trial suggestions
-#     config_kwargs = {
-#         'gpus': 1,
-#         'data': '~/datasets/mydataset.zip',
-#         'cfg': 'stylegan2',
-#         'batch': batch_size,
-#         'aug': 'ada',
-#         'lr': lr,
-#         'beta1': beta1,
-#         # Add other necessary parameters
-#     }
-
-#     # Convert CLI arguments to Optuna compatible format
-#     run_desc, args = setup_training_loop_kwargs(**config_kwargs)
-#     args['lr'] = lr
-#     args['beta1'] = beta1
-#     args['batch_size'] = batch_size
-
-#     # Call the existing training setup
-#     run_desc, args = setup_training_loop_kwargs(**config_kwargs)
-#     result = subprocess_fn(0, args)  # Assume a function that can run training and return a metric value
-#     return result  # The metric you want to minimize or maximize
-
 def main(ctx, outdir, dry_run, **config_kwargs):
     """Train a GAN using the techniques described in the paper
     "Training Generative Adversarial Networks with Limited Data".
@@ -520,8 +492,6 @@ def main(ctx, outdir, dry_run, **config_kwargs):
       <PATH or URL>  Custom network pickle.
     """
     dnnlib.util.Logger(should_flush=True)
-    #prepare dataset
-    prepare_dataset(config_kwargs['data'])
 
     # Setup training options.
     try:
@@ -542,7 +512,7 @@ def main(ctx, outdir, dry_run, **config_kwargs):
     # Print options.
     print()
     print('Training options:')
-    print(json.dumps(args, indent=2))
+    print(json.dumps(args, indent=2, cls=CustomEncoder))
     print()
     print(f'Output directory:   {args.run_dir}')
     print(f'Training data:      {args.training_set_kwargs.path}')
@@ -563,7 +533,7 @@ def main(ctx, outdir, dry_run, **config_kwargs):
     print('Creating output directory...')
     os.makedirs(args.run_dir)
     with open(os.path.join(args.run_dir, 'training_options.json'), 'wt') as f:
-        json.dump(args, f, indent=2)
+        json.dump(args, f, indent=2, cls=CustomEncoder)
 
     # Launch processes.
     print('Launching processes...')
@@ -573,45 +543,6 @@ def main(ctx, outdir, dry_run, **config_kwargs):
             subprocess_fn(rank=0, args=args, temp_dir=temp_dir)
         else:
             torch.multiprocessing.spawn(fn=subprocess_fn, args=(args, temp_dir), nprocs=args.num_gpus)
-    
-def objective(trial):
-    # Define the range of hyperparameters
-    batch_size = trial.suggest_categorical('batch_size', [16, 32, 64])
-    learning_rate = trial.suggest_loguniform('learning_rate', 1e-5, 1e-2)
-    beta1 = trial.suggest_uniform('beta1', 0.0, 0.9)
-
-    # Set up the training configuration using suggested values
-    config_kwargs = {
-        'batch': batch_size,
-        'G_opt_kwargs': {'lr': learning_rate, 'betas': [beta1, 0.999]},
-        'D_opt_kwargs': {'lr': learning_rate, 'betas': [beta1, 0.999]},
-    }
-    
-    # Other fixed settings
-    fixed_kwargs = {
-        'outdir': 'path_to_output_dir',
-        'data': 'path_to_training_data',
-        'gpus': 1,
-        'cfg': 'stylegan2',
-        'metrics': None,
-    }
-
-    # Merge the two dictionaries
-    config_kwargs.update(fixed_kwargs)
-
-    # Training setup function that also executes training and returns a metric (e.g., FID)
-    run_desc, args = setup_training_loop_kwargs(**config_kwargs)
-    # Assume subprocess_fn returns the evaluation metric that we want to minimize
-    result = subprocess_fn(0, args, '/tmp')  # Simplified call
-    return result
-
-def main():
-    study = optuna.create_study(direction='minimize')
-    study.optimize(objective, n_trials=50)
-    print('Best trial:', study.best_trial.params)
-
-if __name__ == "__main__":
-    main()
 
 #----------------------------------------------------------------------------
 

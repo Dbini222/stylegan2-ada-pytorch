@@ -7,13 +7,13 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 import functools
+import gzip
 import io
 import json
 import os
 import pickle
 import sys
 import tarfile
-import gzip
 import zipfile
 from pathlib import Path
 from typing import Callable, Optional, Tuple, Union
@@ -57,11 +57,13 @@ def open_image_folder(source_dir, *, max_images: Optional[int]):
     meta_fname = os.path.join(source_dir, 'dataset.json')
     if os.path.isfile(meta_fname):
         with open(meta_fname, 'r') as file:
-            labels = json.load(file)['labels']
-            if labels is not None:
-                labels = { x[0]: x[1] for x in labels }
-            else:
-                labels = {}
+            data = json.load(file)
+            labels = data["labels"]
+            weights = data["weights"]
+            # if labels is not None:
+            #     labels = { x[0]: x[1] for x in labels }
+            # else:
+            #     labels = {}
 
     max_idx = maybe_min(len(input_images), max_images)
 
@@ -70,7 +72,7 @@ def open_image_folder(source_dir, *, max_images: Optional[int]):
             arch_fname = os.path.relpath(fname, source_dir)
             arch_fname = arch_fname.replace('\\', '/')
             img = np.array(PIL.Image.open(fname))
-            yield dict(img=img, label=labels.get(arch_fname))
+            yield dict(img=img, label=labels.get("images/" + arch_fname), weight=weights.get("images/" + arch_fname))
             if idx >= max_idx-1:
                 break
     return max_idx, iterate_images()
@@ -392,6 +394,7 @@ def convert_dataset(
     dataset_attrs = None
 
     labels = []
+    weights = []
     for idx, image in tqdm(enumerate(input_iter), total=num_files):
         idx_str = f'{idx:08d}'
         archive_fname = f'{idx_str[:5]}/img{idx_str}.png'
@@ -431,9 +434,11 @@ def convert_dataset(
         img.save(image_bits, format='png', compress_level=0, optimize=False)
         save_bytes(os.path.join(archive_root_dir, archive_fname), image_bits.getbuffer())
         labels.append([archive_fname, image['label']] if image['label'] is not None else None)
+        weights.append([archive_fname, image['weight']] if image['weight'] is not None else None)
 
     metadata = {
-        'labels': labels if all(x is not None for x in labels) else None
+        'labels': labels if all(x is not None for x in labels) else None,
+        'weights': weights if all(x is not None for x in weights) else None
     }
     save_bytes(os.path.join(archive_root_dir, 'dataset.json'), json.dumps(metadata))
     close_dest()

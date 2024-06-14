@@ -19,66 +19,47 @@ import PIL.Image
 import psutil
 import torch
 from metrics import metric_main
-from torch.utils.data import WeightedRandomSampler
 from torch_utils import misc, training_stats
 from torch_utils.ops import conv2d_gradfix, grid_sample_gradfix
 
-
 #----------------------------------------------------------------------------
+
 def setup_snapshot_image_grid(training_set, random_seed=0):
     rnd = np.random.RandomState(random_seed)
-    gw = min(10, len(training_set))  # Grid width, constrained for clarity
-    gh = 10  # Grid height
+    gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
+    gh = np.clip(4320 // training_set.image_shape[1], 4, 32)
 
-    # Assume labels are arrays of binary flags or multi-dimensional data
-    # Here we might sort or cluster images based on similarity in labels
-    # For simplicity, just shuffle and display
-    all_indices = list(range(len(training_set)))
-    rnd.shuffle(all_indices)
-    grid_indices = all_indices[:gw * gh]
+    # No labels => show random subset of training samples.
+    if not training_set.has_labels:
+        all_indices = list(range(len(training_set)))
+        rnd.shuffle(all_indices)
+        grid_indices = [all_indices[i % len(all_indices)] for i in range(gw * gh)]
 
-    # Load data for the grid
+    else:
+        # Group training samples by label.
+        label_groups = dict() # label => [idx, ...]
+        for idx in range(len(training_set)):
+            label = tuple(training_set.get_details(idx).raw_label.flat[::-1])
+            if label not in label_groups:
+                label_groups[label] = []
+            label_groups[label].append(idx)
+
+        # Reorder.
+        label_order = sorted(label_groups.keys())
+        for label in label_order:
+            rnd.shuffle(label_groups[label])
+
+        # Organize into grid.
+        grid_indices = []
+        for y in range(gh):
+            label = label_order[y % len(label_order)]
+            indices = label_groups[label]
+            grid_indices += [indices[x % len(indices)] for x in range(gw)]
+            label_groups[label] = [indices[(i + gw) % len(indices)] for i in range(len(indices))]
+
+    # Load data.
     images, labels = zip(*[training_set[i] for i in grid_indices])
-    
-    return (gw, gh), np.stack(images), labels  # Return labels for potential use elsewhere
-
-# def setup_snapshot_image_grid(training_set, random_seed=0):
-#     rnd = np.random.RandomState(random_seed)
-#     gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
-#     gh = np.clip(4320 // training_set.image_shape[1], 4, 32)
-
-#     # No labels => show random subset of training samples.
-#     if not training_set.has_labels:
-#         all_indices = list(range(len(training_set)))
-#         rnd.shuffle(all_indices)
-#         grid_indices = [all_indices[i % len(all_indices)] for i in range(gw * gh)]
-
-#     else:
-#         # Group training samples by label.
-#         label_groups = dict() # label => [idx, ...]
-#         for idx in range(len(training_set)):
-#             label = tuple(training_set.get_details(idx).raw_label.flat[::-1])
-#             if label not in label_groups:
-#                 label_groups[label] = []
-#             label_groups[label].append(idx)
-
-#         # Reorder.
-#         label_order = sorted(label_groups.keys())
-#         for label in label_order:
-#             rnd.shuffle(label_groups[label])
-
-#         # Organize into grid.
-#         grid_indices = []
-#         for y in range(gh):
-#             label = label_order[y % len(label_order)]
-#             indices = label_groups[label]
-#             grid_indices += [indices[x % len(indices)] for x in range(gw)]
-#             label_groups[label] = [indices[(i + gw) % len(indices)] for i in range(len(indices))]
-
-#     # Load data.
-
-#     images, labels = zip(*[training_set[i] for i in grid_indices])
-#     return (gw, gh), np.stack(images), np.stack(labels)
+    return (gw, gh), np.stack(images), np.stack(labels)
 
 #----------------------------------------------------------------------------
 
@@ -137,8 +118,6 @@ def training_loop(
     progress_fn             = None,     # Callback function for updating training progress. Called for all ranks.
 ):
     # Initialize.
-    total_loss = 0
-    num_batches = 0
     start_time = time.time()
     device = torch.device('cuda', rank)
     np.random.seed(random_seed * num_gpus + rank)
@@ -149,14 +128,18 @@ def training_loop(
     conv2d_gradfix.enabled = True                       # Improves training speed.
     grid_sample_gradfix.enabled = True                  # Avoids errors with the augmentation pipe.
 
+    def infinite_loader(loader):
+        while True:
+            for data in loader:
+                yield data
+
     # Load training set.
     if rank == 0:
         print('Loading training set...')
     training_set = dnnlib.util.construct_class_by_name(**training_set_kwargs) # subclass of training.dataset.Dataset
-    weights = [training_set.get_weight(i) for i in range(len(training_set))]  # Extract weights from dataset
-    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)  # Create a weighted sampler
-    # training_set_sampler = misc.InfiniteSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed) #original sampler
-    training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, sampler=sampler, batch_size=batch_size//num_gpus, **data_loader_kwargs)) # with this, higher weight samples are more likely to appear in each batch
+    training_set_sampler = training_set.sampler
+    infinite_data_loader = infinite_loader(torch.utils.data.DataLoader(dataset=training_set, batch_size=batch_size//num_gpus, **data_loader_kwargs))
+    # training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, batch_size=batch_size//num_gpus, **data_loader_kwargs))
     if rank == 0:
         print()
         print('Num images: ', len(training_set))
@@ -278,7 +261,7 @@ def training_loop(
 
         # Fetch training data.
         with torch.autograd.profiler.record_function('data_fetch'):
-            phase_real_img, phase_real_c = next(training_set_iterator)
+            phase_real_img, phase_real_c = next(infinite_data_loader)
             phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
             phase_real_c = phase_real_c.to(device).split(batch_gpu)
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
@@ -302,9 +285,7 @@ def training_loop(
             for round_idx, (real_img, real_c, gen_z, gen_c) in enumerate(zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c)):
                 sync = (round_idx == batch_size // (batch_gpu * num_gpus) - 1)
                 gain = phase.interval
-                loss_value = loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, sync=sync, gain=gain)
-                total_loss += loss_value.item()
-                num_batches += 1
+                loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, sync=sync, gain=gain)
 
             # Update weights.
             phase.module.requires_grad_(False)
@@ -435,13 +416,10 @@ def training_loop(
         maintenance_time = tick_start_time - tick_end_time
         if done:
             break
-        average_loss = total_loss / num_batches
 
     # Done.
     if rank == 0:
         print()
         print('Exiting...')
-    return average_loss
-
 
 #----------------------------------------------------------------------------

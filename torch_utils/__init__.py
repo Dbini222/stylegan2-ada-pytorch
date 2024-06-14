@@ -7,3 +7,4 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 # empty
+from .custom_encoder import CustomEncoder
