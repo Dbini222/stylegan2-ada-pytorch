@@ -8,8 +8,12 @@
 
 import numpy as np
 import torch
-from torch_utils import misc, persistence
-from torch_utils.ops import bias_act, conv2d_resample, fma, upfirdn2d
+from torch_utils import misc
+from torch_utils import persistence
+from torch_utils.ops import conv2d_resample
+from torch_utils.ops import upfirdn2d
+from torch_utils.ops import bias_act
+from torch_utils.ops import fma
 
 #----------------------------------------------------------------------------
 
@@ -172,7 +176,6 @@ class MappingNetwork(torch.nn.Module):
         z_dim,                      # Input latent (Z) dimensionality, 0 = no latent.
         c_dim,                      # Conditioning label (C) dimensionality, 0 = no label.
         w_dim,                      # Intermediate latent (W) dimensionality.
-        multilabel_dim,             # Number of dimensions for multilabel conditioning, 0 = no multilabel.  
         num_ws,                     # Number of intermediate latents to output, None = do not broadcast.
         num_layers      = 8,        # Number of mapping layers.
         embed_features  = None,     # Label embedding dimensionality, None = same as w_dim.
@@ -188,7 +191,6 @@ class MappingNetwork(torch.nn.Module):
         self.num_ws = num_ws
         self.num_layers = num_layers
         self.w_avg_beta = w_avg_beta
-        self.multilabel_dim = multilabel_dim
 
         if embed_features is None:
             embed_features = w_dim
@@ -200,105 +202,51 @@ class MappingNetwork(torch.nn.Module):
 
         if c_dim > 0:
             self.embed = FullyConnectedLayer(c_dim, embed_features)
-            self.embed_c = FullyConnectedLayer(c_dim, w_dim)
-        else:
-            self.embed_c = None
-        # self.embed_multilabel = FullyConnectedLayer(multilabel_dim, w_dim) if multilabel_dim > 0 else None
-        # for idx in range(num_layers):
-        #     in_features = features_list[idx]
-        #     out_features = features_list[idx + 1]
-        #     layer = FullyConnectedLayer(in_features, out_features, activation=activation, lr_multiplier=lr_multiplier)
-        #     setattr(self, f'fc{idx}', layer)
-        input_dim = z_dim + (w_dim if self.embedding_c is not None else 0) + (w_dim if self.embedding_multilabel is not None else 0)
-
-        # Create the series of fully connected layers
-        for _ in range(num_layers):
-            layer = FullyConnectedLayer(input_dim, w_dim, activation='lrelu', lr_multiplier=lr_multiplier)
-            self.layers.append(layer)
-            input_dim = w_dim
+        for idx in range(num_layers):
+            in_features = features_list[idx]
+            out_features = features_list[idx + 1]
+            layer = FullyConnectedLayer(in_features, out_features, activation=activation, lr_multiplier=lr_multiplier)
+            setattr(self, f'fc{idx}', layer)
 
         if num_ws is not None and w_avg_beta is not None:
             self.register_buffer('w_avg', torch.zeros([w_dim]))
 
-    def forward(self, z, c, multilabel, truncation_psi=1, truncation_cutoff=None, skip_w_avg_update=False):
-        # Normalize the latent vector z first if used directly
-        if self.z_dim > 0:
-            z = normalize_2nd_moment(z.to(torch.float32))
-            x = z
+    def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, skip_w_avg_update=False):
+        # Embed, normalize, and concat inputs.
+        x = None
+        with torch.autograd.profiler.record_function('input'):
+            if self.z_dim > 0:
+                misc.assert_shape(z, [None, self.z_dim])
+                x = normalize_2nd_moment(z.to(torch.float32))
+            if self.c_dim > 0:
+                misc.assert_shape(c, [None, self.c_dim])
+                y = normalize_2nd_moment(self.embed(c.to(torch.float32)))
+                x = torch.cat([x, y], dim=1) if x is not None else y
 
-        # Process multiclass labels if present
-        if self.c_dim > 0:
-            c_embedded = self.embed_c(c)  # Embed multiclass labels
-            c_embedded = normalize_2nd_moment(c_embedded)  # Optional: Normalize embedded labels
-            x = torch.cat([x, c_embedded], dim=1) if self.z_dim > 0 else c_embedded
-
-        # Process multilabel inputs if present
-        if self.multilabel_dim > 0:
-            multilabel_embedded = self.embed_multilabel(multilabel)  # Embed multilabels
-            multilabel_embedded = normalize_2nd_moment(multilabel_embedded)  # Optional: Normalize
-            x = torch.cat([x, multilabel_embedded], dim=1)
-
-        # Pass through the fully connected layers
-        for layer in self.layers:
+        # Main layers.
+        for idx in range(self.num_layers):
+            layer = getattr(self, f'fc{idx}')
             x = layer(x)
 
-        # Optionally update the moving average of W
-        if self.w_avg_beta is not None and not skip_w_avg_update and self.training:
-            self.w_avg = self.w_avg.lerp(x.mean(0), self.w_avg_beta)
+        # Update moving average of W.
+        if self.w_avg_beta is not None and self.training and not skip_w_avg_update:
+            with torch.autograd.profiler.record_function('update_w_avg'):
+                self.w_avg.copy_(x.detach().mean(dim=0).lerp(self.w_avg, self.w_avg_beta))
 
-        # Apply truncation trick if specified
-        if truncation_psi != 1 and self.w_avg is not None:
-            w_avg_broadcasted = self.w_avg.unsqueeze(0).repeat(x.size(0), 1)
-            if truncation_cutoff is None:
-                x = truncation_psi * x + (1 - truncation_psi) * w_avg_broadcasted
-            else:
-                x[:, :truncation_cutoff] = truncation_psi * x[:, :truncation_cutoff] + (1 - truncation_psi) * w_avg_broadcasted[:, :truncation_cutoff]
+        # Broadcast.
+        if self.num_ws is not None:
+            with torch.autograd.profiler.record_function('broadcast'):
+                x = x.unsqueeze(1).repeat([1, self.num_ws, 1])
 
+        # Apply truncation.
+        if truncation_psi != 1:
+            with torch.autograd.profiler.record_function('truncate'):
+                assert self.w_avg_beta is not None
+                if self.num_ws is None or truncation_cutoff is None:
+                    x = self.w_avg.lerp(x, truncation_psi)
+                else:
+                    x[:, :truncation_cutoff] = self.w_avg.lerp(x[:, :truncation_cutoff], truncation_psi)
         return x
-
-
-    # def forward(self, z, c, multilabel, truncation_psi=1, truncation_cutoff=None, skip_w_avg_update=False):
-    #     # Embed, normalize, and concat inputs.
-    #     #Embed and normalise multiclass and multilabel
-    #     if self.c_dim > 0:
-    #         c = self.embed_c(c)
-    #     if self.multilabel_dim > 0:
-    #         multilabel = self.embed_multilabel(multilabel)
-    #     # Concatenate all inputs...
-    #     x = torch.cat([z, c, multilabel], dim=1)
-    #     with torch.autograd.profiler.record_function('input'):
-    #         if self.z_dim > 0:
-    #             misc.assert_shape(z, [None, self.z_dim])
-    #             x = normalize_2nd_moment(z.to(torch.float32))
-    #         if self.c_dim > 0:
-    #             misc.assert_shape(c, [None, self.c_dim])
-    #             y = normalize_2nd_moment(self.embed(c.to(torch.float32)))
-    #             x = torch.cat([x, y], dim=1) if x is not None else y
-
-    #     # Main layers.
-    #     for idx in range(self.num_layers):
-    #         layer = getattr(self, f'fc{idx}')
-    #         x = layer(x)
-
-    #     # Update moving average of W.
-    #     if self.w_avg_beta is not None and self.training and not skip_w_avg_update:
-    #         with torch.autograd.profiler.record_function('update_w_avg'):
-    #             self.w_avg.copy_(x.detach().mean(dim=0).lerp(self.w_avg, self.w_avg_beta))
-
-    #     # Broadcast.
-    #     if self.num_ws is not None:
-    #         with torch.autograd.profiler.record_function('broadcast'):
-    #             x = x.unsqueeze(1).repeat([1, self.num_ws, 1])
-
-    #     # Apply truncation.
-    #     if truncation_psi != 1:
-    #         with torch.autograd.profiler.record_function('truncate'):
-    #             assert self.w_avg_beta is not None
-    #             if self.num_ws is None or truncation_cutoff is None:
-    #                 x = self.w_avg.lerp(x, truncation_psi)
-    #             else:
-    #                 x[:, :truncation_cutoff] = self.w_avg.lerp(x[:, :truncation_cutoff], truncation_psi)
-    #     return x
 
 #----------------------------------------------------------------------------
 
@@ -531,7 +479,6 @@ class Generator(torch.nn.Module):
         z_dim,                      # Input latent (Z) dimensionality.
         c_dim,                      # Conditioning label (C) dimensionality.
         w_dim,                      # Intermediate latent (W) dimensionality.
-        multilabel_dim,            # Number of dimensions for multilabel conditioning, 0 = no multilabel.
         img_resolution,             # Output resolution.
         img_channels,               # Number of output color channels.
         mapping_kwargs      = {},   # Arguments for MappingNetwork.
@@ -541,15 +488,14 @@ class Generator(torch.nn.Module):
         self.z_dim = z_dim
         self.c_dim = c_dim
         self.w_dim = w_dim
-        self.multilabel_dim = multilabel_dim
         self.img_resolution = img_resolution
         self.img_channels = img_channels
         self.synthesis = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, **synthesis_kwargs)
         self.num_ws = self.synthesis.num_ws
-        self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim,multilabel_dim=multilabel_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
+        self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
 
-    def forward(self, z, c, multiclass_label, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
-        ws = self.mapping(z, c,multiclass_label, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
+    def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
+        ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
         img = self.synthesis(ws, **synthesis_kwargs)
         return img
 
@@ -558,8 +504,6 @@ class Generator(torch.nn.Module):
 @persistence.persistent_class
 class DiscriminatorBlock(torch.nn.Module):
     def __init__(self,
-        c_dim,                      # Conditioning label (C) dimensionality.
-        multilabel_dim,             # Number of dimensions for multilabel conditioning, 0 = no multilabel.
         in_channels,                        # Number of input channels, 0 = first block.
         tmp_channels,                       # Number of intermediate channels.
         out_channels,                       # Number of output channels.
@@ -585,9 +529,7 @@ class DiscriminatorBlock(torch.nn.Module):
         self.use_fp16 = use_fp16
         self.channels_last = (use_fp16 and fp16_channels_last)
         self.register_buffer('resample_filter', upfirdn2d.setup_filter(resample_filter))
-        self.embed_c = FullyConnectedLayer(c_dim, some_intermediate_dim) if c_dim > 0 else None
-        self.embed_multilabel = FullyConnectedLayer(multilabel_dim, some_intermediate_dim) if multilabel_dim > 0 else None
-        
+
         self.num_layers = 0
         def trainable_gen():
             while True:
@@ -731,7 +673,6 @@ class DiscriminatorEpilogue(torch.nn.Module):
 class Discriminator(torch.nn.Module):
     def __init__(self,
         c_dim,                          # Conditioning label (C) dimensionality.
-        multilabel_dim,                 # Number of dimensions for multilabel conditioning, 0 = no multilabel.
         img_resolution,                 # Input resolution.
         img_channels,                   # Number of input color channels.
         architecture        = 'resnet', # Architecture: 'orig', 'skip', 'resnet'.
@@ -746,29 +687,12 @@ class Discriminator(torch.nn.Module):
     ):
         super().__init__()
         self.c_dim = c_dim
-        self.multilabel_dim = multilabel_dim
         self.img_resolution = img_resolution
         self.img_resolution_log2 = int(np.log2(img_resolution))
         self.img_channels = img_channels
         self.block_resolutions = [2 ** i for i in range(self.img_resolution_log2, 2, -1)]
         channels_dict = {res: min(channel_base // res, channel_max) for res in self.block_resolutions + [4]}
         fp16_resolution = max(2 ** (self.img_resolution_log2 + 1 - num_fp16_res), 8)
-
-        # Initial processing layers added for multilabel
-        self.initial_conv = Conv2dLayer(img_channels, 64, kernel_size=3, activation='lrelu')
-        self.initial_embedding_c = FullyConnectedLayer(c_dim, 64) if c_dim > 0 else None
-        self.initial_embedding_multilabel = FullyConnectedLayer(multilabel_dim, 64) if multilabel_dim > 0 else None
-        
-        # Main discriminator body, added for multilabel
-        self.body = torch.nn.Sequential(
-            Conv2dLayer(64, 128, kernel_size=3, activation='lrelu', down=2),
-            Conv2dLayer(128, 256, kernel_size=3, activation='lrelu', down=2),
-            Conv2dLayer(256, 512, kernel_size=3, activation='lrelu', down=2),
-            Conv2dLayer(512, 1024, kernel_size=3, activation='lrelu', down=2),
-            Conv2dLayer(1024, 1024, kernel_size=3, activation='lrelu', down=2),
-            FullyConnectedLayer(1024 * (img_resolution // 32) ** 2, 1024, activation='lrelu'),
-            FullyConnectedLayer(1024, 1)
-        )
 
         if cmap_dim is None:
             cmap_dim = channels_dict[4]
@@ -790,24 +714,16 @@ class Discriminator(torch.nn.Module):
             self.mapping = MappingNetwork(z_dim=0, c_dim=c_dim, w_dim=cmap_dim, num_ws=None, w_avg_beta=None, **mapping_kwargs)
         self.b4 = DiscriminatorEpilogue(channels_dict[4], cmap_dim=cmap_dim, resolution=4, **epilogue_kwargs, **common_kwargs)
 
-    # def forward(self, img, c, **block_kwargs):
-    #     x = None
-    #     for res in self.block_resolutions:
-    #         block = getattr(self, f'b{res}')
-    #         x, img = block(x, img, **block_kwargs)
+    def forward(self, img, c, **block_kwargs):
+        x = None
+        for res in self.block_resolutions:
+            block = getattr(self, f'b{res}')
+            x, img = block(x, img, **block_kwargs)
 
-    #     cmap = None
-    #     if self.c_dim > 0:
-    #         cmap = self.mapping(None, c)
-    #     x = self.b4(x, img, cmap)
-    #     return x
-    def forward(self, img, labels, multilabels):
-        x = self.initial_conv(img)
-        if self.initial_embedding_c is not None:
-            x += self.initial_embedding_c(labels).view(-1, 64, 1, 1)
-        if self.initial_embedding_multilabel is not None:
-            x += self.initial_embedding_multilabel(multilabels).view(-1, 64, 1, 1)
-        x = self.body(x)
+        cmap = None
+        if self.c_dim > 0:
+            cmap = self.mapping(None, c)
+        x = self.b4(x, img, cmap)
         return x
 
 #----------------------------------------------------------------------------

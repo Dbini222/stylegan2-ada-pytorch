@@ -57,8 +57,9 @@ def open_image_folder(source_dir, *, max_images: Optional[int]):
     meta_fname = os.path.join(source_dir, 'dataset.json')
     if os.path.isfile(meta_fname):
         with open(meta_fname, 'r') as file:
-            labels = json.load(file)['labels']
-            weights = json.load(file){'weights'}
+            data = json.load(file)
+            labels = data["labels"]
+            weights = data["weights"]
             # if labels is not None:
             #     labels = { x[0]: x[1] for x in labels }
             # else:
@@ -393,6 +394,7 @@ def convert_dataset(
     dataset_attrs = None
 
     labels = []
+    weights = []
     for idx, image in tqdm(enumerate(input_iter), total=num_files):
         idx_str = f'{idx:08d}'
         archive_fname = f'{idx_str[:5]}/img{idx_str}.png'
@@ -432,9 +434,11 @@ def convert_dataset(
         img.save(image_bits, format='png', compress_level=0, optimize=False)
         save_bytes(os.path.join(archive_root_dir, archive_fname), image_bits.getbuffer())
         labels.append([archive_fname, image['label']] if image['label'] is not None else None)
+        weights.append([archive_fname, image['weight']] if image['weight'] is not None else None)
 
     metadata = {
-        'labels': labels if all(x is not None for x in labels) else None
+        'labels': labels if all(x is not None for x in labels) else None,
+        'weights': weights if all(x is not None for x in weights) else None
     }
     save_bytes(os.path.join(archive_root_dir, 'dataset.json'), json.dumps(metadata))
     close_dest()

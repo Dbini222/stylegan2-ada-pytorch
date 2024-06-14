@@ -13,6 +13,7 @@ import PIL.Image
 import json
 import torch
 import dnnlib
+from torch.utils.data import WeightedRandomSampler
 
 try:
     import pyspng
@@ -173,6 +174,10 @@ class ImageFolderDataset(Dataset):
         self._image_fnames = sorted(fname for fname in self._all_fnames if self._file_ext(fname) in PIL.Image.EXTENSION)
         if len(self._image_fnames) == 0:
             raise IOError('No image files found in the specified path')
+        
+        self.labels = self._load_raw_labels()
+        self.weights = self._load_raw_weights()
+        self.sampler = WeightedRandomSampler(self.weights, num_samples=len(self.weights), replacement=True)
 
         name = os.path.splitext(os.path.basename(self._path))[0]
         raw_shape = [len(self._image_fnames)] + list(self._load_raw_image(0).shape)
@@ -218,19 +223,40 @@ class ImageFolderDataset(Dataset):
             image = image[:, :, np.newaxis] # HW => HWC
         image = image.transpose(2, 0, 1) # HWC => CHW
         return image
+    
 
     def _load_raw_labels(self):
         fname = 'dataset.json'
         if fname not in self._all_fnames:
             return None
         with self._open_file(fname) as f:
-            labels = json.load(f)['labels']
-        if labels is None:
+            data = json.load(f)
+            labels = data['labels']
+            weights = data['weights']
+        if labels is None or weights is None:
             return None
         labels = dict(labels)
         labels = [labels[fname.replace('\\', '/')] for fname in self._image_fnames]
         labels = np.array(labels)
         labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
+        weights = dict(weights)
+        weights = [weights[fname.replace('\\', '/')] for fname in self._image_fnames]
+        weights = np.array(weights, dtype=np.float32)
         return labels
+    
+    def _load_raw_weights(self):
+        fname = 'dataset.json'
+        if fname not in self._all_fnames:
+            return None
+        with self._open_file(fname) as f:
+            data = json.load(f)
+            weights = data['weights']
+        if weights is None:
+            return None
+        weights = dict(weights)
+        weights = [weights[fname.replace('\\', '/')] for fname in self._image_fnames]
+        weights = np.array(weights, dtype=np.float32)
+        return weights
+
 
 #----------------------------------------------------------------------------
