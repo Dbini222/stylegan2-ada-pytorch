@@ -16,11 +16,13 @@ import json
 import tempfile
 import torch
 import dnnlib
+from torch.utils.data import WeightedRandomSampler
 
 from training import training_loop
 from metrics import metric_main
 from torch_utils import training_stats
 from torch_utils import custom_ops
+from torch_utils import CustomEncoder
 
 #----------------------------------------------------------------------------
 
@@ -105,9 +107,21 @@ def setup_training_loop_kwargs(
     assert data is not None
     assert isinstance(data, str)
     args.training_set_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False)
-    args.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=3, prefetch_factor=2)
+    args.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=3, prefetch_factor=2) #commented out for custom weighting
     try:
         training_set = dnnlib.util.construct_class_by_name(**args.training_set_kwargs) # subclass of training.dataset.Dataset
+        if training_set.sampler:
+            print("using weights")
+            args.data_loader_kwargs.update({
+                'sampler': training_set.sampler,
+                'shuffle': False  # It's important to disable shuffle when using a sampler
+            })
+        else:
+            # Optionally handle cases where no sampler is available
+            print("Not using weights")
+            args.data_loader_kwargs.update({
+                'shuffle': True
+            })
         args.training_set_kwargs.resolution = training_set.resolution # be explicit about resolution
         args.training_set_kwargs.use_labels = training_set.has_labels # be explicit about labels
         args.training_set_kwargs.max_size = len(training_set) # be explicit about dataset size
@@ -500,7 +514,7 @@ def main(ctx, outdir, dry_run, **config_kwargs):
     # Print options.
     print()
     print('Training options:')
-    print(json.dumps(args, indent=2))
+    print(json.dumps(args, indent=2, cls=CustomEncoder))
     print()
     print(f'Output directory:   {args.run_dir}')
     print(f'Training data:      {args.training_set_kwargs.path}')
@@ -521,7 +535,7 @@ def main(ctx, outdir, dry_run, **config_kwargs):
     print('Creating output directory...')
     os.makedirs(args.run_dir)
     with open(os.path.join(args.run_dir, 'training_options.json'), 'wt') as f:
-        json.dump(args, f, indent=2)
+        json.dump(args, f, indent=2, cls=CustomEncoder)
 
     # Launch processes.
     print('Launching processes...')
