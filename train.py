@@ -16,11 +16,9 @@ import tempfile
 
 import click
 import dnnlib
-import optuna
 import torch
-from FirestoreDataset import FirestoreDataset
 from metrics import metric_main
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import WeightedRandomSampler
 from torch_utils import CustomEncoder, custom_ops, training_stats
 from training import training_loop
 

@@ -6,70 +6,35 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-import os
-import time
 import copy
 import json
+import os
 import pickle
-import psutil
-import PIL.Image
-import numpy as np
-import torch
-import dnnlib
-from torch_utils import misc
-from torch_utils import training_stats
-from torch_utils.ops import conv2d_gradfix
-from torch_utils.ops import grid_sample_gradfix
+import time
 
+import dnnlib
 import legacy
+import numpy as np
+import PIL.Image
+import psutil
+import torch
 from metrics import metric_main
 from torch_utils import misc, training_stats
 from torch_utils.ops import conv2d_gradfix, grid_sample_gradfix
 
 #----------------------------------------------------------------------------
 
-
 def setup_snapshot_image_grid(training_set, random_seed=0):
     rnd = np.random.RandomState(random_seed)
     gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
     gh = np.clip(4320 // training_set.image_shape[1], 4, 32)
-    gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
-    gh = np.clip(4320 // training_set.image_shape[1], 4, 32)
 
     # No labels => show random subset of training samples.
     if not training_set.has_labels:
         all_indices = list(range(len(training_set)))
         rnd.shuffle(all_indices)
         grid_indices = [all_indices[i % len(all_indices)] for i in range(gw * gh)]
-    # No labels => show random subset of training samples.
-    if not training_set.has_labels:
-        all_indices = list(range(len(training_set)))
-        rnd.shuffle(all_indices)
-        grid_indices = [all_indices[i % len(all_indices)] for i in range(gw * gh)]
 
-    else:
-        # Group training samples by label.
-        label_groups = dict() # label => [idx, ...]
-        for idx in range(len(training_set)):
-            label = tuple(training_set.get_details(idx).raw_label.flat[::-1])
-            if label not in label_groups:
-                label_groups[label] = []
-            label_groups[label].append(idx)
-
-        # Reorder.
-        label_order = sorted(label_groups.keys())
-        for label in label_order:
-            rnd.shuffle(label_groups[label])
-
-        # Organize into grid.
-        grid_indices = []
-        for y in range(gh):
-            label = label_order[y % len(label_order)]
-            indices = label_groups[label]
-            grid_indices += [indices[x % len(indices)] for x in range(gw)]
-            label_groups[label] = [indices[(i + gw) % len(indices)] for i in range(len(indices))]
-
-    # Load data.
     else:
         # Group training samples by label.
         label_groups = dict() # label => [idx, ...]
@@ -94,7 +59,6 @@ def setup_snapshot_image_grid(training_set, random_seed=0):
 
     # Load data.
     images, labels = zip(*[training_set[i] for i in grid_indices])
-    return (gw, gh), np.stack(images), np.stack(labels)
     return (gw, gh), np.stack(images), np.stack(labels)
 
 #----------------------------------------------------------------------------
@@ -169,18 +133,10 @@ def training_loop(
             for data in loader:
                 yield data
 
-    def infinite_loader(loader):
-        while True:
-            for data in loader:
-                yield data
-
     # Load training set.
     if rank == 0:
         print('Loading training set...')
     training_set = dnnlib.util.construct_class_by_name(**training_set_kwargs) # subclass of training.dataset.Dataset
-    training_set_sampler = training_set.sampler
-    infinite_data_loader = infinite_loader(torch.utils.data.DataLoader(dataset=training_set, batch_size=batch_size//num_gpus, **data_loader_kwargs))
-    # training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, batch_size=batch_size//num_gpus, **data_loader_kwargs))
     training_set_sampler = training_set.sampler
     infinite_data_loader = infinite_loader(torch.utils.data.DataLoader(dataset=training_set, batch_size=batch_size//num_gpus, **data_loader_kwargs))
     # training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, batch_size=batch_size//num_gpus, **data_loader_kwargs))
@@ -306,7 +262,6 @@ def training_loop(
         # Fetch training data.
         with torch.autograd.profiler.record_function('data_fetch'):
             phase_real_img, phase_real_c = next(infinite_data_loader)
-            phase_real_img, phase_real_c = next(infinite_data_loader)
             phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
             phase_real_c = phase_real_c.to(device).split(batch_gpu)
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
@@ -330,7 +285,6 @@ def training_loop(
             for round_idx, (real_img, real_c, gen_z, gen_c) in enumerate(zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c)):
                 sync = (round_idx == batch_size // (batch_gpu * num_gpus) - 1)
                 gain = phase.interval
-                loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, sync=sync, gain=gain)
                 loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, sync=sync, gain=gain)
 
             # Update weights.
