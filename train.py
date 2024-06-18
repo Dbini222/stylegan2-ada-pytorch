@@ -105,7 +105,7 @@ def setup_training_loop_kwargs(
     assert data is not None
     assert isinstance(data, str)
     args.training_set_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False)
-    args.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=1, prefetch_factor=2) #commented out for custom weighting
+    args.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=3, prefetch_factor=2) #commented out for custom weighting
     try:
         training_set = dnnlib.util.construct_class_by_name(**args.training_set_kwargs) # subclass of training.dataset.Dataset
         if training_set.sampler:
@@ -547,8 +547,8 @@ def main(ctx, outdir, dry_run, **config_kwargs):
 #----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+#     torch.backends.cudnn.deterministic = True
+#     torch.backends.cudnn.benchmark = False
     main() # pylint: disable=no-value-for-parameter
 
 #----------------------------------------------------------------------------
