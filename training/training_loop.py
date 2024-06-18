@@ -18,9 +18,9 @@ import numpy as np
 import PIL.Image
 import psutil
 import torch
-import torch.distributed as dist
+# import torch.distributed as dist
 from metrics import metric_main
-from torch.cuda.amp import GradScaler, autocast
+# from torch.cuda.amp import GradScaler, autocast
 
 from torch_utils import misc, training_stats
 from torch_utils.ops import conv2d_gradfix, grid_sample_gradfix
@@ -85,20 +85,20 @@ def save_image_grid(img, fname, drange, grid_size):
         PIL.Image.fromarray(img, 'RGB').save(fname)
 
 #----------------------------------------------------------------------------
-def set_seed(seed):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-def broadcast_model_params(model, src=0):
-    for param in model.parameters():
-        torch.distributed.broadcast(param.data, src=0)
-    #for buffer in model.buffers():
-     #   torch.distributed.broadcast(buffer.data, src=0)
-def print_tensor_stats(tensor, name):
-    print(f"Tensor {name}: mean={tensor.mean().item()}, std={tensor.std().item()}, min={tensor.min().item()}, max={tensor.max().item()}")
+# def set_seed(seed):
+#     np.random.seed(seed)
+#     torch.manual_seed(seed)
+#     torch.cuda.manual_seed(seed)
+#     torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
+#     torch.backends.cudnn.deterministic = True
+#     torch.backends.cudnn.benchmark = False
+# def broadcast_model_params(model, src=0):
+#     for param in model.parameters():
+#         torch.distributed.broadcast(param.data, src=0)
+#     #for buffer in model.buffers():
+#      #   torch.distributed.broadcast(buffer.data, src=0)
+# def print_tensor_stats(tensor, name):
+#     print(f"Tensor {name}: mean={tensor.mean().item()}, std={tensor.std().item()}, min={tensor.min().item()}, max={tensor.max().item()}")
 
 def training_loop(
     run_dir                 = '.',      # Output directory.
@@ -114,8 +114,8 @@ def training_loop(
     random_seed             = 0,        # Global random seed.
     num_gpus                = 1,        # Number of GPUs participating in the training.
     rank                    = 0,        # Rank of the current process in [0, num_gpus[.
-    batch_size              = 1,        # Total batch size for one training iteration. Can be larger than batch_gpu * num_gpus.
-    batch_gpu               = 1,        # Number of samples processed at a time by one GPU.
+    batch_size              = 4,        # Total batch size for one training iteration. Can be larger than batch_gpu * num_gpus.
+    batch_gpu               = 4,        # Number of samples processed at a time by one GPU.
     ema_kimg                = 10,       # Half-life of the exponential moving average (EMA) of generator weights.
     ema_rampup              = None,     # EMA ramp-up coefficient.
     G_reg_interval          = 4,        # How often to perform regularization for G? None = disable lazy regularization.
@@ -192,16 +192,8 @@ def training_loop(
         c = torch.empty([batch_gpu, G.c_dim], device=device)
         img = misc.print_module_summary(G, [z, c])
         misc.print_module_summary(D, [img, c])
-   #in order to force the same variables across all gpus
-    z = torch.empty([batch_gpu, G.z_dim], device=device)
-    c = torch.empty([batch_gpu, G.c_dim], device=device)
-    img = misc.print_module_summary(G, [z, c])
-    misc.print_module_summary(D, [img, c])
+        
 # Setup augmentation.
-    #if rank != 0:
-     #   dist.barrier()
-      #  misc.print_module_summary(G, [z, c])
-       # misc.print_module_summary(D, [img, c])
 
     if rank == 0:
         print('Setting up augmentation...')
@@ -212,7 +204,7 @@ def training_loop(
         augment_pipe.p.copy_(torch.as_tensor(augment_p))
         if ada_target is not None:
             ada_stats = training_stats.Collector(regex='Loss/signs/real')
-
+        
     # Distribute across GPUs.
     if rank == 0:
         print(f'Distributing across {num_gpus} GPUs...')
@@ -225,18 +217,8 @@ def training_loop(
         if name is not None:
             ddp_modules[name] = module
 
-    #if rank ==0:
-     #   broadcast_model_params(G)
-      #  broadcast_model_params(D)
-       # broadcast_model_params(G_ema)
-
     #print_tensor_stats(G.synthesis.b4.const, "G.synthesis.b4.const before broadcast")
     # Setup training phases.
-    
-    if rank == 0:
-        print('Setting up training phases...')  
-        img = misc.print_module_summary(G, [z, c])
-        misc.print_module_summary(D, [img, c])
     loss = dnnlib.util.construct_class_by_name(device=device, **ddp_modules, **loss_kwargs) # subclass of training.loss.Loss
     phases = []
     for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval), ('D', D, D_opt_kwargs, D_reg_interval)]:
