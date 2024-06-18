@@ -18,7 +18,10 @@ import numpy as np
 import PIL.Image
 import psutil
 import torch
+import torch.distributed as dist
 from metrics import metric_main
+from torch.cuda.amp import GradScaler, autocast
+
 from torch_utils import misc, training_stats
 from torch_utils.ops import conv2d_gradfix, grid_sample_gradfix
 
@@ -82,6 +85,20 @@ def save_image_grid(img, fname, drange, grid_size):
         PIL.Image.fromarray(img, 'RGB').save(fname)
 
 #----------------------------------------------------------------------------
+def set_seed(seed):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+def broadcast_model_params(model, src=0):
+    for param in model.parameters():
+        torch.distributed.broadcast(param.data, src=0)
+    #for buffer in model.buffers():
+     #   torch.distributed.broadcast(buffer.data, src=0)
+def print_tensor_stats(tensor, name):
+    print(f"Tensor {name}: mean={tensor.mean().item()}, std={tensor.std().item()}, min={tensor.min().item()}, max={tensor.max().item()}")
 
 def training_loop(
     run_dir                 = '.',      # Output directory.
@@ -97,8 +114,8 @@ def training_loop(
     random_seed             = 0,        # Global random seed.
     num_gpus                = 1,        # Number of GPUs participating in the training.
     rank                    = 0,        # Rank of the current process in [0, num_gpus[.
-    batch_size              = 4,        # Total batch size for one training iteration. Can be larger than batch_gpu * num_gpus.
-    batch_gpu               = 4,        # Number of samples processed at a time by one GPU.
+    batch_size              = 1,        # Total batch size for one training iteration. Can be larger than batch_gpu * num_gpus.
+    batch_gpu               = 1,        # Number of samples processed at a time by one GPU.
     ema_kimg                = 10,       # Half-life of the exponential moving average (EMA) of generator weights.
     ema_rampup              = None,     # EMA ramp-up coefficient.
     G_reg_interval          = 4,        # How often to perform regularization for G? None = disable lazy regularization.
@@ -121,6 +138,7 @@ def training_loop(
     start_time = time.time()
     device = torch.device('cuda', rank)
     np.random.seed(random_seed * num_gpus + rank)
+  #  set_seed(random_seed * num_gpus + rank)
     torch.manual_seed(random_seed * num_gpus + rank)
     torch.backends.cudnn.benchmark = cudnn_benchmark    # Improves training speed.
     torch.backends.cuda.matmul.allow_tf32 = allow_tf32  # Allow PyTorch to internally use tf32 for matmul
@@ -154,7 +172,7 @@ def training_loop(
     G = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     G_ema = copy.deepcopy(G).eval()
-
+    resume_pkl = '../output/00006-training_dataset-cond-paper256-resumecustom/network-snapshot-000201.pkl'
     # Resume from existing pickle.
     if (resume_pkl is not None) and (rank == 0):
         print(f'Resuming from "{resume_pkl}"')
@@ -163,14 +181,28 @@ def training_loop(
         for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
             misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
 
+    #if num_gpus > 1:
+     #   broadcast_model_params(G)
+      #  broadcast_model_params(D)
+       # broadcast_model_params(G_ema)
+       # dist.barrier()
     # Print network summary tables.
     if rank == 0:
         z = torch.empty([batch_gpu, G.z_dim], device=device)
         c = torch.empty([batch_gpu, G.c_dim], device=device)
         img = misc.print_module_summary(G, [z, c])
         misc.print_module_summary(D, [img, c])
+   #in order to force the same variables across all gpus
+    z = torch.empty([batch_gpu, G.z_dim], device=device)
+    c = torch.empty([batch_gpu, G.c_dim], device=device)
+    img = misc.print_module_summary(G, [z, c])
+    misc.print_module_summary(D, [img, c])
+# Setup augmentation.
+    #if rank != 0:
+     #   dist.barrier()
+      #  misc.print_module_summary(G, [z, c])
+       # misc.print_module_summary(D, [img, c])
 
-    # Setup augmentation.
     if rank == 0:
         print('Setting up augmentation...')
     augment_pipe = None
@@ -193,9 +225,18 @@ def training_loop(
         if name is not None:
             ddp_modules[name] = module
 
+    #if rank ==0:
+     #   broadcast_model_params(G)
+      #  broadcast_model_params(D)
+       # broadcast_model_params(G_ema)
+
+    #print_tensor_stats(G.synthesis.b4.const, "G.synthesis.b4.const before broadcast")
     # Setup training phases.
+    
     if rank == 0:
-        print('Setting up training phases...')
+        print('Setting up training phases...')  
+        img = misc.print_module_summary(G, [z, c])
+        misc.print_module_summary(D, [img, c])
     loss = dnnlib.util.construct_class_by_name(device=device, **ddp_modules, **loss_kwargs) # subclass of training.loss.Loss
     phases = []
     for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval), ('D', D, D_opt_kwargs, D_reg_interval)]:
@@ -249,14 +290,14 @@ def training_loop(
     if rank == 0:
         print(f'Training for {total_kimg} kimg...')
         print()
-    cur_nimg = 0
-    cur_tick = 0
+    cur_nimg = 201
+    cur_tick = cur_nimg 
     tick_start_nimg = cur_nimg
     tick_start_time = time.time()
     maintenance_time = tick_start_time - start_time
     batch_idx = 0
     if progress_fn is not None:
-        progress_fn(0, total_kimg)
+        progress_fn(cur_nimg // 1000, total_kimg)
     while True:
 
         # Fetch training data.
@@ -293,7 +334,7 @@ def training_loop(
                 for param in phase.module.parameters():
                     if param.grad is not None:
                         misc.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
-                phase.opt.step()
+                phase.opt.step() 
             if phase.end_event is not None:
                 phase.end_event.record(torch.cuda.current_stream(device))
 
